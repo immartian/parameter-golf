@@ -158,16 +158,21 @@ class BindingCTW:
         """
         Map binding energy to Dirichlet concentration.
 
-        c(B) = c_base × (1 + β × sigmoid(B - median_B))
+        In the Dirichlet CTW formula p = (c × p_prev + count) / (c + ctx_count):
+          - HIGH c → trust the prior/backup more (smooth)
+          - LOW c → trust the observed counts more (sharp)
 
-        This gives:
-          - Low binding → c ≈ c_base (standard smoothing)
-          - High binding → c ≈ c_base × (1 + β) (trust n-gram counts more)
+        So the mapping is INVERSE:
+          - High binding (rare, specific) → LOW c → trust counts (they're reliable)
+          - Low binding (common, ambiguous) → HIGH c → smooth (counts are noisy)
+
+        c(B) = c_base × (1 + β × (1 - sigmoid(B - median_B)))
+             = c_base × (1 + β × sigmoid(median_B - B))
         """
-        # Sigmoid centering: use median binding as threshold
         median_b = np.median(binding[binding > 0]) if np.any(binding > 0) else 1.0
-        normalized = 1.0 / (1.0 + np.exp(-(binding - median_b)))
-        return self.c_base * (1.0 + self.beta * normalized)
+        # INVERSE sigmoid: high binding → low value → low concentration
+        inv_normalized = 1.0 / (1.0 + np.exp(-(median_b - binding)))
+        return self.c_base * (1.0 + self.beta * inv_normalized)
 
     # -----------------------------------------------------------------
     # Cache operations (compatible with PR #986 NgramCache)
@@ -249,13 +254,19 @@ class BindingCTW:
         context_len: int = 8,
     ) -> np.ndarray:
         """
-        Hierarchical Dirichlet CTW mixing with binding-energy-modulated
-        concentration. Replaces fixed c=5.0 with c(B(ctx)).
+        Hierarchical Dirichlet CTW mixing with evidence-aware concentration.
 
-        For each position, iterate from lowest to highest order:
-          p = (c(B) × p_prev + full_count) / (c(B) + ctx_count)
+        The key insight: concentration should be LOWER when n-gram evidence
+        is strong (high ctx_count at high orders) and HIGHER when evidence
+        is weak. This is the self-model: the compression knows when to
+        trust itself.
 
-        where c(B) = c_base × (1 + β × sigmoid(B - median_B))
+        For each order, concentration adapts based on:
+          c_eff = c_base / (1 + β × log1p(ctx_count) × specificity_boost)
+
+        where specificity_boost = avg IDF of context tokens.
+        High counts + rare context → very low c → trust counts fully.
+        Low counts + common context → c ≈ c_base → smooth toward backup.
 
         Args:
             val_np: full token array
@@ -271,14 +282,18 @@ class BindingCTW:
         mask = self.mask
         primes = self.PRIMES
 
-        # Compute binding energy for all positions
-        positions = np.arange(start, end)
-        binding = self.binding_energy_batch(val_np, positions, context_len)
+        # Precompute IDF for specificity boost
+        if self.total_tokens > 0:
+            log_N = math.log(max(self.total_tokens, 1))
+            idf = np.zeros(self.vocab_size, dtype=np.float64)
+            nonzero = self.token_freq > 0
+            idf[nonzero] = log_N - np.log(self.token_freq[nonzero])
+            max_idf = idf.max() if idf.max() > 0 else 1.0
+            idf_norm = idf / max_idf  # normalize to [0, 1]
+        else:
+            idf_norm = np.ones(self.vocab_size, dtype=np.float64)
 
-        # Map to concentration parameters
-        concentration = self.concentration_for_binding(binding)
-
-        # Iterate lowest to highest order (each posterior becomes next prior)
+        # Iterate lowest to highest order
         for oi in range(self.num_orders):
             order = self.min_order + oi
             cw = order - 1
@@ -306,9 +321,21 @@ class BindingCTW:
                 fc = full_c[idx].astype(np.float64)
                 cc = ctx_c[idx].astype(np.float64)
                 prev_p = blended[first_valid + idx]
-                # Per-position concentration from binding energy
-                c = concentration[first_valid + idx]
-                blended[first_valid + idx] = (c * prev_p + fc) / (c + cc)
+
+                # Compute specificity boost from context tokens
+                spec_boost = np.ones(len(idx), dtype=np.float64)
+                for k in range(min(cw, context_len)):
+                    ctx_tok = val_np[abs_s + idx - cw + k].astype(np.int64)
+                    ctx_tok = np.clip(ctx_tok, 0, self.vocab_size - 1)
+                    spec_boost += idf_norm[ctx_tok]
+                spec_boost /= (min(cw, context_len) + 1)  # normalize
+
+                # Evidence-aware concentration:
+                # More evidence + rare context → lower c → trust counts
+                c_eff = self.c_base / (1.0 + self.beta * np.log1p(cc) * spec_boost)
+                c_eff = np.clip(c_eff, 0.1, self.c_base * 5)
+
+                blended[first_valid + idx] = (c_eff * prev_p + fc) / (c_eff + cc)
 
         return blended
 
